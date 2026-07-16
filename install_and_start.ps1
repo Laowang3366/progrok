@@ -6,7 +6,7 @@ $env:PYTHONIOENCODING = "utf-8"
 
 trap {
     Write-Host ""
-    Write-Host "安装或启动失败：$($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "Installation or startup failed: $($_.Exception.Message)" -ForegroundColor Red
     exit 1
 }
 
@@ -46,38 +46,38 @@ function Find-Python {
 
 $Python = Find-Python
 if (-not $Python) {
-    Write-Host "未检测到 Python 3.10+，正在安装 Python 3.12..."
+    Write-Host "Python 3.10+ was not found. Installing Python 3.12..."
     $winget = Get-Command "winget" -ErrorAction SilentlyContinue
     if ($winget) {
         & $winget.Source install --id Python.Python.3.12 --exact --scope user --silent --accept-package-agreements --accept-source-agreements
         if ($LASTEXITCODE -ne 0) {
-            Write-Warning "winget 安装失败，将尝试 Python 官方安装程序。"
+            Write-Warning "winget installation failed. Trying the official Python installer."
         }
     }
     $Python = Find-Python
     if (-not $Python) {
         $Installer = Join-Path $env:TEMP "python-3.12.10-amd64.exe"
         $Url = "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe"
-        Write-Host "正在从 Python 官网下载安装程序..."
+        Write-Host "Downloading the installer from python.org..."
         Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $Installer
         $process = Start-Process -FilePath $Installer -ArgumentList @(
             "/quiet", "InstallAllUsers=0", "PrependPath=1", "Include_pip=1",
             "Include_launcher=1", "Include_test=0", "Shortcuts=0"
         ) -Wait -PassThru
         if ($process.ExitCode -ne 0) {
-            throw "Python 安装失败，退出代码：$($process.ExitCode)"
+            throw "Python installation failed with exit code $($process.ExitCode)."
         }
         $Python = Find-Python
     }
 }
 
 if (-not $Python) {
-    throw "Python 已执行安装但仍无法定位，请重新打开终端后再次运行。"
+    throw "Python was installed but could not be located. Reopen the terminal and run this script again."
 }
 
 $env:PROGROK_PYTHON = $Python
-Write-Host "使用 Python：$Python"
+Write-Host "Using Python: $Python"
 & (Join-Path $Root "start.ps1")
-if (-not $?) { throw "start.ps1 执行失败。" }
+if (-not $?) { throw "start.ps1 failed." }
 Write-Host ""
-Write-Host "启动完成，请访问：http://127.0.0.1:3080"
+Write-Host "Startup completed. Open http://127.0.0.1:3080"
