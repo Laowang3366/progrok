@@ -69,7 +69,7 @@
 
         <div class="section-title"><span>03</span> 代理与批量</div>
         <div class="grid">
-          <label class="wide">代理池<textarea name="proxy" rows="4" placeholder="每行一个代理；留空则直连"></textarea></label>
+          <label class="wide"><span class="field-label proxy-field-label">代理池<button type="button" id="detect-proxy" class="inline-button">检测本机代理</button></span><textarea name="proxy" rows="4" placeholder="每行一个代理；留空时自动检测本机代理"></textarea></label>
           <label>代理用户名<input name="proxy_username"></label>
           <label>代理密码<input name="proxy_password" type="password" autocomplete="off"></label>
           <label>轮换策略<select name="proxy_strategy"><option value="round_robin">轮询</option><option value="random">随机</option><option value="sticky">固定</option></select></label>
@@ -116,6 +116,6 @@
     </div>
   </main>
   <div id="toast" role="status" aria-live="polite"></div>
-  <script src="/static/app.js?v=20260715-8"></script>
+  <script src="/static/app.js?v=20260716-9"></script>
 </body>
 </html>

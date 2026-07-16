@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from threading import RLock
 from typing import Any, Literal
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from fastapi import FastAPI, HTTPException, Query
@@ -21,6 +22,7 @@ from export_formats import build_cpa_record, build_sub2api_payload, cpa_filename
 ROOT = Path(__file__).resolve().parent
 CONFIG_FILE = ROOT / "config.json"
 STATIC_DIR = ROOT / "static"
+SOLVER_PROXY_FILE = ROOT / "turnstile-solver" / "proxies.txt"
 _config_lock = RLock()
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -85,6 +87,25 @@ def load_config() -> dict[str, Any]:
         return data
 
 
+def _sync_solver_proxy_file(cfg: dict[str, Any]) -> int:
+    from proxy_pool import parse_proxy_pool
+
+    proxies = parse_proxy_pool(
+        str(cfg.get("proxy") or ""),
+        username=str(cfg.get("proxy_username") or ""),
+        password=str(cfg.get("proxy_password") or ""),
+        fallback_env=False,
+    )
+    if not proxies:
+        SOLVER_PROXY_FILE.unlink(missing_ok=True)
+        return 0
+    SOLVER_PROXY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = SOLVER_PROXY_FILE.with_suffix(".txt.tmp")
+    tmp.write_text("\n".join(proxies) + "\n", encoding="utf-8")
+    os.replace(tmp, SOLVER_PROXY_FILE)
+    return len(proxies)
+
+
 def save_config(data: dict[str, Any]) -> dict[str, Any]:
     clean = {**DEFAULT_CONFIG, **{k: v for k, v in data.items() if k in DEFAULT_CONFIG}}
     selected_format = str(clean.get("registration_json_format") or "cpa").lower()
@@ -95,6 +116,7 @@ def save_config(data: dict[str, Any]) -> dict[str, Any]:
         tmp.write_text(json.dumps(clean, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         os.replace(tmp, CONFIG_FILE)
     apply_environment(clean)
+    _sync_solver_proxy_file(clean)
     return clean
 
 
@@ -115,7 +137,9 @@ def apply_environment(cfg: dict[str, Any]) -> None:
         os.environ[key] = str(value or "")
 
 
-apply_environment(load_config())
+_initial_config = load_config()
+apply_environment(_initial_config)
+_sync_solver_proxy_file(_initial_config)
 import grok_build_adapter as registration  # noqa: E402
 
 
@@ -451,6 +475,119 @@ def detect_solver() -> dict[str, Any]:
     }
 
 
+def _normalize_detected_proxy(raw: str, *, scheme_hint: str = "") -> dict[str, str] | None:
+    value = str(raw or "").strip()
+    hint = str(scheme_hint or "").lower()
+    if not value:
+        return None
+    if ";" in value or ("=" in value and "://" not in value):
+        choices: dict[str, str] = {}
+        for chunk in value.split(";"):
+            key, separator, item = chunk.partition("=")
+            if separator and item.strip():
+                choices[key.strip().lower()] = item.strip()
+        for key in ("https", "http", "socks", "socks5"):
+            if choices.get(key):
+                value = choices[key]
+                hint = key
+                break
+    if "://" not in value:
+        scheme = "socks5" if hint.startswith("socks") else "http"
+        value = f"{scheme}://{value}"
+    try:
+        parsed = urlparse(value)
+        port = parsed.port
+    except ValueError:
+        return None
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https", "socks5", "socks5h"}:
+        return None
+    if not parsed.hostname or not port:
+        return None
+    host = parsed.hostname
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return {
+        "proxy": f"{scheme}://{host}:{port}",
+        "proxy_username": unquote(parsed.username or ""),
+        "proxy_password": unquote(parsed.password or ""),
+    }
+
+
+def _detect_windows_system_proxy() -> tuple[dict[str, str] | None, str]:
+    try:
+        import winreg
+
+        path = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path) as key:
+            try:
+                enabled = bool(winreg.QueryValueEx(key, "ProxyEnable")[0])
+            except OSError:
+                enabled = False
+            try:
+                server = str(winreg.QueryValueEx(key, "ProxyServer")[0] or "")
+            except OSError:
+                server = ""
+            try:
+                pac_url = str(winreg.QueryValueEx(key, "AutoConfigURL")[0] or "")
+            except OSError:
+                pac_url = ""
+        if enabled and server:
+            return _normalize_detected_proxy(server), "Windows 系统代理"
+        return None, "检测到 PAC 自动代理，无法直接提取固定代理地址" if pac_url else ""
+    except (ImportError, OSError):
+        return None, ""
+
+
+def _detect_local_proxy() -> dict[str, Any]:
+    detected, note = _detect_windows_system_proxy()
+    if detected:
+        return {"ok": True, "found": True, "source": "Windows 系统代理", **detected}
+
+    for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy"):
+        detected = _normalize_detected_proxy(os.environ.get(key, ""))
+        if detected:
+            return {"ok": True, "found": True, "source": f"环境变量 {key}", **detected}
+
+    common_ports = [(7890, "http"), (7897, "http"), (10809, "http"), (10808, "socks5"), (1080, "socks5")]
+
+    def listening(item: tuple[int, str]) -> tuple[int, str] | None:
+        port, scheme = item
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.15):
+                return port, scheme
+        except OSError:
+            return None
+
+    open_ports: list[tuple[int, str]] = []
+    with ThreadPoolExecutor(max_workers=len(common_ports)) as pool:
+        for result in pool.map(listening, common_ports):
+            if result:
+                open_ports.append(result)
+    if open_ports:
+        rank = {port: index for index, (port, _) in enumerate(common_ports)}
+        port, scheme = min(open_ports, key=lambda item: rank[item[0]])
+        return {
+            "ok": True,
+            "found": True,
+            "source": f"本地监听端口 {port}",
+            "proxy": f"{scheme}://127.0.0.1:{port}",
+            "proxy_username": "",
+            "proxy_password": "",
+        }
+    return {
+        "ok": True,
+        "found": False,
+        "proxy": None,
+        "error": note or "未检测到 Windows 系统代理、代理环境变量或常见本地代理端口",
+    }
+
+
+@app.get("/api/proxy/detect")
+def detect_proxy() -> dict[str, Any]:
+    return _detect_local_proxy()
+
+
 @app.get("/api/config")
 def get_config() -> dict[str, Any]:
     return load_config()
@@ -498,6 +635,7 @@ def start_register(settings: Settings | None = None, paused: bool = False) -> di
     # Starting a task persists only its batch size controls. Mailbox credentials
     # still require the explicit "保存配置" action.
     apply_environment(cfg)
+    _sync_solver_proxy_file(cfg)
     result = registration.start_registration(
         captcha_provider=cfg["captcha_provider"],
         local_solver_url=cfg["local_solver_url"],

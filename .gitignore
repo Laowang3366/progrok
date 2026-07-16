@@ -1,5 +1,7 @@
 .venv/
 turnstile-solver/.venv/
+turnstile-solver/proxies.txt
+turnstile-solver/proxies.txt.tmp
 __pycache__/
 *.pyc
 *.pid

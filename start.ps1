@@ -56,7 +56,7 @@ if (-not $SolverUp) {
     & $SolverPython -m camoufox fetch
     $solver = Start-Process -FilePath $SolverPython -ArgumentList @(
         "api_solver.py", "--browser_type", "camoufox", "--thread", "1",
-        "--host", "127.0.0.1", "--port", "5072"
+        "--proxy", "--host", "127.0.0.1", "--port", "5072"
     ) -WorkingDirectory $SolverRoot -WindowStyle Hidden -PassThru
     $solver.Id | Set-Content -LiteralPath (Join-Path $Root ".solver.pid") -Encoding ascii
     Write-Host "Turnstile Solver started: PID=$($solver.Id), port=5072"
