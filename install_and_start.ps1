@@ -4,6 +4,12 @@ $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+trap {
+    Write-Host ""
+    Write-Host "安装或启动失败：$($_.Exception.Message)" -ForegroundColor Red
+    exit 1
+}
+
 function Test-Python([string]$Path) {
     if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return $false }
     try {
@@ -72,6 +78,6 @@ if (-not $Python) {
 $env:PROGROK_PYTHON = $Python
 Write-Host "使用 Python：$Python"
 & (Join-Path $Root "start.ps1")
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+if (-not $?) { throw "start.ps1 执行失败。" }
 Write-Host ""
 Write-Host "启动完成，请访问：http://127.0.0.1:3080"
