@@ -16,6 +16,9 @@ from export_formats import (
 
 DEFAULT_PROBE_MODEL = "grok-4.5"
 PROBE_PERMISSION_RETRY_DELAYS = (5.0, 10.0, 20.0)
+PROBE_RESPONSE_TIMEOUT = httpx.Timeout(75.0, connect=10.0)
+PROBE_MODELS_TIMEOUT = httpx.Timeout(20.0, connect=10.0)
+PROBE_TRANSIENT_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
 
 
 def _cpa_api_base_url(value: str) -> str:
@@ -48,6 +51,107 @@ def _is_transient_permission_error(status_code: int, error: str) -> bool:
         "access to the chat endpoint is denied" in text
         or "log into console.x.ai and update the permissions" in text
     )
+
+
+def _models_from_payload(payload: Any) -> list[Any]:
+    if not isinstance(payload, dict):
+        return []
+    models = payload.get("data")
+    if not isinstance(models, list):
+        models = payload.get("models")
+    return models if isinstance(models, list) else []
+
+
+def _lightweight_probe(
+    http: httpx.Client,
+    *,
+    base_url: str,
+    headers: dict[str, str],
+    model: str,
+    started: float,
+    response_error: str,
+    response_status_code: int | None = None,
+) -> dict[str, Any]:
+    """Fallback to /models so slow inference is not mistaken for a dead account."""
+    try:
+        response = http.get(
+            f"{base_url}/models",
+            headers=headers,
+            timeout=PROBE_MODELS_TIMEOUT,
+        )
+        latency_ms = int((time.time() - started) * 1000)
+        if response.status_code < 400:
+            try:
+                models = _models_from_payload(response.json())
+            except Exception:
+                models = []
+            if models:
+                return {
+                    "ok": True,
+                    "available": True,
+                    "chat_ready": False,
+                    "degraded": True,
+                    "fallback": "models",
+                    "classification": "model_busy",
+                    "model": model,
+                    "status_code": response.status_code,
+                    "response_status_code": response_status_code,
+                    "latency_ms": latency_ms,
+                    "retry_count": 0,
+                    "message": "消息响应异常，但轻量模型验证通过",
+                    "response_error": response_error[:220],
+                }
+            return {
+                "ok": False,
+                "available": None,
+                "retryable": True,
+                "classification": "uncertain",
+                "fallback": "models",
+                "model": model,
+                "status_code": response.status_code,
+                "response_status_code": response_status_code,
+                "latency_ms": latency_ms,
+                "error": "消息响应异常，且 /models 暂未返回可用模型",
+            }
+        error = _error_text(response)
+        if response.status_code == 401:
+            return {
+                "ok": False,
+                "available": False,
+                "retryable": False,
+                "classification": "invalid_credential",
+                "fallback": "models",
+                "model": model,
+                "status_code": response.status_code,
+                "response_status_code": response_status_code,
+                "latency_ms": latency_ms,
+                "error": error or "认证凭证无效",
+            }
+        retryable = response.status_code in PROBE_TRANSIENT_STATUS_CODES or response.status_code == 403
+        return {
+            "ok": False,
+            "available": None if retryable else False,
+            "retryable": retryable,
+            "classification": "uncertain" if retryable else "probe_failed",
+            "fallback": "models",
+            "model": model,
+            "status_code": response.status_code,
+            "response_status_code": response_status_code,
+            "latency_ms": latency_ms,
+            "error": error or response_error,
+        }
+    except httpx.HTTPError as exc:
+        return {
+            "ok": False,
+            "available": None,
+            "retryable": True,
+            "classification": "uncertain",
+            "fallback": "models",
+            "model": model,
+            "response_status_code": response_status_code,
+            "latency_ms": int((time.time() - started) * 1000),
+            "error": f"消息与轻量验证均暂时无响应：{str(exc)[:180]}",
+        }
 
 
 def probe_account(
@@ -86,11 +190,16 @@ def probe_account(
     }
     started = time.time()
     owned = client is None
-    http = client or httpx.Client(timeout=httpx.Timeout(30.0, connect=10.0))
+    http = client or httpx.Client(timeout=PROBE_RESPONSE_TIMEOUT)
     try:
         retry_count = 0
         while True:
-            response = http.post(f"{base_url}/responses", headers=headers, json=body)
+            response = http.post(
+                f"{base_url}/responses",
+                headers=headers,
+                json=body,
+                timeout=PROBE_RESPONSE_TIMEOUT,
+            )
             latency_ms = int((time.time() - started) * 1000)
             if response.status_code < 400:
                 return {
@@ -102,29 +211,42 @@ def probe_account(
                     "retry_count": retry_count,
                 }
             error = _error_text(response)
-            if (
-                retry_count >= len(PROBE_PERMISSION_RETRY_DELAYS)
-                or not _is_transient_permission_error(response.status_code, error)
-            ):
+            if response.status_code == 401:
                 return {
                     "ok": False,
                     "available": False,
+                    "retryable": False,
+                    "classification": "invalid_credential",
                     "model": model,
                     "status_code": response.status_code,
                     "latency_ms": latency_ms,
                     "retry_count": retry_count,
                     "error": error,
                 }
+            if (
+                retry_count >= len(PROBE_PERMISSION_RETRY_DELAYS)
+                or not _is_transient_permission_error(response.status_code, error)
+            ):
+                return _lightweight_probe(
+                    http,
+                    base_url=base_url,
+                    headers=headers,
+                    model=model,
+                    started=started,
+                    response_error=error,
+                    response_status_code=response.status_code,
+                )
             time.sleep(PROBE_PERMISSION_RETRY_DELAYS[retry_count])
             retry_count += 1
     except httpx.HTTPError as exc:
-        return {
-            "ok": False,
-            "available": False,
-            "model": model,
-            "latency_ms": int((time.time() - started) * 1000),
-            "error": f"网络错误：{str(exc)[:220]}",
-        }
+        return _lightweight_probe(
+            http,
+            base_url=base_url,
+            headers=headers,
+            model=model,
+            started=started,
+            response_error=f"网络错误：{str(exc)[:220]}",
+        )
     finally:
         if owned:
             http.close()

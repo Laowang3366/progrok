@@ -19,10 +19,16 @@ from pydantic import BaseModel, Field
 
 from export_formats import build_cpa_record, build_sub2api_payload, cpa_filename
 
-ROOT = Path(__file__).resolve().parent
-CONFIG_FILE = ROOT / "config.json"
-STATIC_DIR = ROOT / "static"
-SOLVER_PROXY_FILE = ROOT / "turnstile-solver" / "proxies.txt"
+BACKEND_DIR = Path(__file__).resolve().parent
+APP_DIR = BACKEND_DIR.parent
+CONFIG_DIR = APP_DIR / "config"
+WEB_DIR = APP_DIR / "web"
+RUNTIME_DIR = APP_DIR / "runtime"
+DATA_DIR = RUNTIME_DIR / "data"
+VENDOR_DIR = APP_DIR / "vendor"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+STATIC_DIR = WEB_DIR / "static"
+SOLVER_PROXY_FILE = VENDOR_DIR / "turnstile-solver" / "proxies.txt"
 _config_lock = RLock()
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -42,6 +48,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "count": 1,
     "concurrency": 1,
     "stagger_ms": 1200,
+    "auto_tune_enabled": False,
     "probe_delay_sec": 0,
     "probe_model": "grok-4.5",
     "probe_concurrency": 1,
@@ -112,6 +119,7 @@ def save_config(data: dict[str, Any]) -> dict[str, Any]:
     clean["registration_json_format"] = selected_format if selected_format in {"cpa", "sub2api"} else "cpa"
     clean["auto_import_target"] = clean["registration_json_format"]
     with _config_lock:
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = CONFIG_FILE.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(clean, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         os.replace(tmp, CONFIG_FILE)
@@ -160,6 +168,7 @@ class Settings(BaseModel):
     count: int = Field(1, ge=1, le=10000)
     concurrency: int = Field(1, ge=1, le=10)
     stagger_ms: int = Field(1200, ge=0, le=60000)
+    auto_tune_enabled: bool = False
     probe_delay_sec: int = Field(0, ge=0, le=600)
     probe_model: str = "grok-4.5"
     probe_concurrency: int = Field(1, ge=1, le=10)
@@ -239,17 +248,17 @@ def health() -> dict[str, Any]:
         "ok": bool(available.get("available")),
         "service": "progrok-registration",
         "registration": available,
-        "accounts_dir": str(ROOT / "data" / "accounts"),
+        "accounts_dir": str(DATA_DIR / "accounts"),
     }
 
 
 @app.get("/api/output-paths")
 def output_paths() -> dict[str, Any]:
     paths = [
-        {"key": "accounts", "label": "账号文件目录", "path": ROOT / "data" / "accounts"},
-        {"key": "auth", "label": "合并 auth.json", "path": ROOT / "data" / "auth.json"},
-        {"key": "sso", "label": "SSO 输出目录", "path": ROOT / "grok-build-auth" / "sso_output"},
-        {"key": "debug", "label": "注册诊断目录", "path": ROOT / "data" / "register_sso"},
+        {"key": "accounts", "label": "账号文件目录", "path": DATA_DIR / "accounts"},
+        {"key": "auth", "label": "合并 auth.json", "path": DATA_DIR / "auth.json"},
+        {"key": "sso", "label": "SSO 输出目录", "path": DATA_DIR / "sso_output"},
+        {"key": "debug", "label": "注册诊断目录", "path": DATA_DIR / "register_sso"},
     ]
     return {
         "ok": True,
@@ -263,7 +272,7 @@ def output_paths() -> dict[str, Any]:
 def _stored_auth_by_email() -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
     scores: dict[str, int] = {}
-    for path in sorted((ROOT / "data" / "accounts").glob("*.json")):
+    for path in sorted((DATA_DIR / "accounts").glob("*.json")):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
@@ -306,7 +315,7 @@ def _stored_auth_by_email() -> dict[str, dict[str, Any]]:
 
 
 def _download_records(batch_id: str | None = None) -> list[dict[str, Any]]:
-    output_dir = ROOT / "grok-build-auth" / "sso_output"
+    output_dir = DATA_DIR / "sso_output"
     stored_auth = _stored_auth_by_email()
     records: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
@@ -593,6 +602,14 @@ def get_config() -> dict[str, Any]:
     return load_config()
 
 
+@app.get("/api/performance")
+def performance_profile(provider: Literal["local", "yescaptcha"] | None = Query(None)) -> dict[str, Any]:
+    cfg = load_config()
+    return registration.get_registration_performance_profile(
+        provider or cfg.get("captcha_provider"), cfg.get("local_solver_url")
+    )
+
+
 @app.get("/api/mail/provider-presets")
 def mail_provider_presets(response: Response) -> dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
@@ -626,6 +643,7 @@ def start_register(settings: Settings | None = None, paused: bool = False) -> di
         persisted = load_config()
         persisted["count"] = cfg["count"]
         persisted["concurrency"] = cfg["concurrency"]
+        persisted["auto_tune_enabled"] = cfg["auto_tune_enabled"]
         persisted["probe_concurrency"] = cfg["probe_concurrency"]
         persisted["import_concurrency"] = cfg["import_concurrency"]
         save_config(persisted)
@@ -656,6 +674,7 @@ def start_register(settings: Settings | None = None, paused: bool = False) -> di
         probe_delay_sec=cfg["probe_delay_sec"],
         post_registration=_post_registration_config(cfg),
         start_paused=paused,
+        auto_tune_enabled=cfg["auto_tune_enabled"],
     )
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result)

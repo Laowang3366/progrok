@@ -27,8 +27,12 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-ROOT = Path(__file__).resolve().parent
-GBA = ROOT / "grok-build-auth"
+from performance_tuning import AdaptiveRegistrationTuner, machine_profile, system_sample
+
+BACKEND_DIR = Path(__file__).resolve().parent
+APP_DIR = BACKEND_DIR.parent
+RUNTIME_DATA_DIR = APP_DIR / "runtime" / "data"
+GBA = APP_DIR / "vendor" / "grok-build-auth"
 ADAPTER_BUILD = "2026-07-15-import-success-only-8"
 # Newly registered accounts often need a short settle window before probe.
 REGISTER_PROBE_DELAY_SEC = float(
@@ -80,13 +84,26 @@ _batches: dict[str, dict[str, Any]] = {}
 _lock = threading.RLock()
 # batch_id -> True while a local ThreadPool spawner is alive in THIS process.
 _active_batch_runners: dict[str, bool] = {}
-# Local captcha solver is process-local and can collapse under fan-out; serialize
-# the createTask/getTaskResult handshake across registration workers.
-_local_captcha_lock = threading.RLock()
+# Keep local captcha fan-out aligned with the Solver browser pool. A bounded
+# semaphore prevents registration workers from overfilling the available slots.
+try:
+    _LOCAL_CAPTCHA_CONCURRENCY = max(
+        1,
+        min(
+            10,
+            int(os.environ.get("GROK2API_LOCAL_CAPTCHA_CONCURRENCY", "3") or 3),
+        ),
+    )
+except (TypeError, ValueError):
+    _LOCAL_CAPTCHA_CONCURRENCY = 3
+_local_captcha_slots = threading.BoundedSemaphore(_LOCAL_CAPTCHA_CONCURRENCY)
 _pipeline_stagger_lock = threading.RLock()
 _pipeline_next_allowed = {"probe": 0.0, "import": 0.0}
 _pipeline_queue_lock = threading.RLock()
 _pipeline_queues: dict[str, dict[str, Any]] = {}
+PROBE_RECHECK_DELAYS = (30.0, 120.0, 300.0)
+_probe_slots_lock = threading.RLock()
+_probe_slots: dict[tuple[str, int], threading.BoundedSemaphore] = {}
 # Cross-batch in-flight registration jobs (3 open batches * 8 workers used to
 # stampede local Camoufox + xAI device-flow). Cap total concurrent registrations.
 try:
@@ -170,11 +187,6 @@ def wait_pipeline_stagger(phase: str, delay_ms: int | float | None) -> None:
         time.sleep(wait)
 
 REG_BATCH_RUNNER_LOCK_TTL = int(os.environ.get("GROK2API_REG_RUNNER_LOCK_TTL", "90") or 90)
-# How many jobs may be pre-created (mailbox + session) beyond the live concurrency
-# cap. Keep small so stop/cancel doesn't waste dozens of mailboxes.
-REG_PREFETCH_SLOTS = int(os.environ.get("GROK2API_REG_PREFETCH_SLOTS", "1") or 1)
-
-
 def _now() -> float:
     return time.time()
 
@@ -265,6 +277,7 @@ def _snapshot_reg_config(
     stagger_ms: int,
     mail_provider: str | None = None,
     post_registration: dict[str, Any] | None = None,
+    auto_tune_enabled: bool = False,
 ) -> dict[str, Any]:
     """Config snapshot kept with the in-memory/Redis batch while it is running."""
     return {
@@ -281,6 +294,7 @@ def _snapshot_reg_config(
         "local_solver_url": "http://127.0.0.1:5072",
         "mail_provider": (mail_provider or "moemail").strip().lower() or "moemail",
         "post_registration": dict(post_registration or {}),
+        "auto_tune_enabled": bool(auto_tune_enabled),
     }
 
 
@@ -302,6 +316,16 @@ _TERMINAL_STATUSES = frozenset(
         "stopped",
     }
 )
+
+_REGISTRATION_STAGE_BY_STATUS = {
+    "waiting_solver": "captcha",
+    "solving_turnstile": "captcha",
+    "waiting_email": "email",
+    "registering": "account",
+    "creating_account": "account",
+    "fetching_sso": "auth",
+    "importing": "auth",
+}
 
 
 def _is_cancel_status(status: str | None) -> bool:
@@ -461,6 +485,31 @@ def _pipeline_group(sess: dict[str, Any]) -> str:
     return str(sess.get("batch_id") or f"session-{sess.get('id') or uuid.uuid4().hex}")
 
 
+def _probe_group_slots(group: str, limit: int) -> threading.BoundedSemaphore:
+    key = (str(group or "probe"), max(1, int(limit)))
+    with _probe_slots_lock:
+        slots = _probe_slots.get(key)
+        if slots is None:
+            slots = threading.BoundedSemaphore(key[1])
+            _probe_slots[key] = slots
+        return slots
+
+
+def _append_session_event(
+    sess: dict[str, Any], status: str, message: str, *, at: float | None = None
+) -> None:
+    events = [dict(item) for item in (sess.get("events") or []) if isinstance(item, dict)]
+    event = {
+        "at": float(at or _now()),
+        "status": str(status or "unknown"),
+        "message": str(message or ""),
+    }
+    if events and all(events[-1].get(key) == event[key] for key in ("status", "message")):
+        return
+    events.append(event)
+    sess["events"] = events[-60:]
+
+
 def _set_pipeline_session_state(
     sid: str, status: str, message: str, *, phase: str, position: int, limit: int
 ) -> None:
@@ -469,14 +518,29 @@ def _set_pipeline_session_state(
         if not current:
             return
         current = dict(current)
-        current["status"] = status
-        current["message"] = message
-        current["pipeline_queue"] = {
+        queue_state = {
             "phase": phase,
             "position": max(0, int(position)),
             "concurrency": max(1, int(limit)),
         }
+        if phase == "probe":
+            probe = dict(current.get("probe") or {})
+            probe.update(
+                {
+                    "state": "running" if status == "probing" else "queued",
+                    "queued": status != "probing",
+                    "position": queue_state["position"],
+                    "concurrency": queue_state["concurrency"],
+                }
+            )
+            current["probe"] = probe
+            current["probe_queue"] = queue_state
+        else:
+            current["status"] = status
+            current["message"] = message
+            current["pipeline_queue"] = queue_state
         current["updated_at"] = _now()
+        _append_session_event(current, status, message, at=current["updated_at"])
         _sessions[sid] = current
         _mirror_reg_sess(sid, current)
 
@@ -518,13 +582,16 @@ def _finish_pipeline_without_import(sid: str, config: dict[str, Any]) -> None:
         current = _sessions.get(sid) or dict(sess)
         current["auto_import"] = auto_import
         current["status"] = "imported"
-        current["message"] = "本地账号已保存；自动导入未开启；可按需手动测活"
+        current["message"] = "本地账号已保存；自动导入未开启；自动测活独立执行"
         current["pipeline_queue"] = {
             "phase": "done",
             "position": 0,
             "concurrency": int(config.get("pipeline_concurrency") or 1),
         }
         current["updated_at"] = _now()
+        _append_session_event(
+            current, current["status"], current["message"], at=current["updated_at"]
+        )
         _sessions[sid] = current
         _mirror_reg_sess(sid, current)
 
@@ -540,6 +607,9 @@ def _mark_pipeline_cancelled(sid: str) -> None:
         current["error"] = "cancelled"
         current["cancel_requested"] = True
         current["updated_at"] = _now()
+        _append_session_event(
+            current, current["status"], current["message"], at=current["updated_at"]
+        )
         _sessions[sid] = current
         _mirror_reg_sess(sid, current)
 
@@ -557,13 +627,16 @@ def _run_probe_wave(group: str, session_ids: list[str], limit: int) -> None:
             limit=limit,
         )
 
+    slots = _probe_group_slots(group, limit)
+
     def run_one(sid: str) -> dict[str, Any]:
-        sess = _load_reg_sess(sid) or {}
-        if _session_cancel_requested(sess):
-            _mark_pipeline_cancelled(sid)
-            return {"ok": False, "session_id": sid, "cancelled": True}
-        config = dict(sess.get("_post_registration") or {})
-        return _retry_probe_now(sid, config, manual_retry=False)
+        with slots:
+            sess = _load_reg_sess(sid) or {}
+            if _session_cancel_requested(sess):
+                _mark_pipeline_cancelled(sid)
+                return {"ok": False, "session_id": sid, "cancelled": True}
+            config = dict(sess.get("_post_registration") or {})
+            return _retry_probe_now(sid, config, manual_retry=False)
 
     with ThreadPoolExecutor(max_workers=limit, thread_name_prefix="gba-probe-wave") as pool:
         futures = {pool.submit(run_one, sid): sid for sid in session_ids}
@@ -578,11 +651,20 @@ def _run_probe_wave(group: str, session_ids: list[str], limit: int) -> None:
                         "count": 1,
                         "ok": 0,
                         "fail": 1,
+                        "state": "complete",
+                        "queued": False,
+                        "position": 0,
                         "results": [
                             {"account_id": None, "ok": False, "error": str(exc)[:180]}
                         ],
                     }
                     current["updated_at"] = _now()
+                    _append_session_event(
+                        current,
+                        "probe_complete",
+                        f"队列测活异常结束：{str(exc)[:180]}",
+                        at=current["updated_at"],
+                    )
                     _sessions[sid] = current
                     _mirror_reg_sess(sid, current)
 
@@ -647,7 +729,6 @@ def _pipeline_dispatch_loop(key: str) -> None:
         phase = "probe"
         group = ""
         limit = 1
-        close_import = False
         with _pipeline_queue_lock:
             state = _pipeline_queues.get(key)
             if state is None:
@@ -663,12 +744,9 @@ def _pipeline_dispatch_loop(key: str) -> None:
                 _refresh_pipeline_positions(state)
             elif not pending and closed:
                 _pipeline_queues.pop(key, None)
-                close_import = phase == "probe"
+                return
             else:
                 state["in_wave"] = False
-        if close_import:
-            _close_pipeline_phase(group, "import")
-            return
         if not wave:
             time.sleep(0.2)
             continue
@@ -910,6 +988,10 @@ def probe_local_solver(
         "pool_ready": None,
         "error": None,
         "status_code": None,
+        "thread": None,
+        "queue": None,
+        "owned": None,
+        "in_flight": None,
     }
     try:
         import urllib.error
@@ -936,6 +1018,8 @@ def probe_local_solver(
         if isinstance(data, dict):
             out["lazy"] = data.get("lazy")
             out["pool_ready"] = data.get("pool_ready")
+            for key in ("thread", "queue", "owned", "in_flight"):
+                out[key] = data.get(key)
             # Solver process is ready when /health answers ok=true.
             # pool_ready may still be false under TURNSTILE_LAZY=1 — that is OK;
             # browsers warm on the first captcha task.
@@ -1386,14 +1470,17 @@ def _prepare_registration_session(
     password = f"Aa{os.urandom(5).hex()}9!xZ"
     sid = f"gba_{uuid.uuid4().hex[:16]}"
 
+    created_at = _now()
+    initial_message = f"queued; email={email}"
     sess = {
         "id": sid,
         "status": "queued",
-        "created_at": _now(),
-        "updated_at": _now(),
+        "created_at": created_at,
+        "updated_at": created_at,
         "email": email,
         "password": password,
-        "message": f"queued; email={email}",
+        "message": initial_message,
+        "events": [{"at": created_at, "status": "queued", "message": initial_message}],
         "sso": None,
         "oauth": None,
         "auth_json": None,
@@ -1515,6 +1602,7 @@ def start_registration(
     probe_delay_sec: float | int | None = None,
     post_registration: dict[str, Any] | None = None,
     start_paused: bool = False,
+    auto_tune_enabled: bool = False,
 ) -> dict[str, Any]:
     """Start one or many registration sessions (multi-thread).
 
@@ -1630,7 +1718,9 @@ def start_registration(
         )
     except (TypeError, ValueError):
         workers = DEFAULT_CONCURRENCY
-    workers = max(1, min(workers, MAX_CONCURRENCY, n))
+    requested_workers = max(1, min(workers, MAX_CONCURRENCY, n))
+    performance_profile = get_registration_performance_profile(provider, local_solver_url)
+    workers = requested_workers
 
     try:
         stagger = int(stagger_ms if stagger_ms is not None else 400)
@@ -1687,6 +1777,7 @@ def start_registration(
         stagger_ms=stagger,
         mail_provider=mail_prov,
         post_registration=post_registration,
+        auto_tune_enabled=auto_tune_enabled,
     )
     reg_cfg["proxy_strategy"] = proxy_strat
     reg_cfg["proxy_pool_count"] = len(proxy_pool)
@@ -1697,7 +1788,11 @@ def start_registration(
         "updated_at": _now(),
         "count": n,
         "concurrency": workers,
+        "configured_concurrency": requested_workers,
         "stagger_ms": stagger,
+        "scheduling_mode": "slot_fill",
+        "auto_tune_enabled": bool(auto_tune_enabled),
+        "performance_profile": performance_profile,
         "session_ids": [],
         "adapter_build": ADAPTER_BUILD,
         "message": f"batch started count={n} concurrency={workers}",
@@ -1775,6 +1870,7 @@ def start_registration(
         expiry_ms=expiry_ms,
         mail_provider=mail_prov,
         post_registration=post_registration,
+        auto_tune_enabled=auto_tune_enabled,
     )
     if not started.get("ok"):
         return started
@@ -1792,6 +1888,7 @@ def start_registration(
         "batch_id": batch_id,
         "count": n,
         "concurrency": workers,
+        "configured_concurrency": requested_workers,
         "stagger_ms": stagger,
         "session_ids": sids,
         "sessions": sessions,
@@ -1822,6 +1919,7 @@ def _spawn_batch_runner(
     expiry_ms: int | None,
     mail_provider: str | None = None,
     post_registration: dict[str, Any] | None = None,
+    auto_tune_enabled: bool = False,
 ) -> dict[str, Any]:
     """Start the ThreadPool spawner for a batch (also used by resume/reclaim)."""
     bid = str(batch_id or "").strip()
@@ -1918,6 +2016,7 @@ def _spawn_batch_runner(
     proxy_snapshot = (proxy or "\n".join(proxy_pool) or "").strip()
     workers = max(1, min(int(concurrency or DEFAULT_CONCURRENCY), MAX_CONCURRENCY, remaining))
     stagger = max(0, min(int(400 if stagger_ms is None else stagger_ms), 60_000))
+    tuner = AdaptiveRegistrationTuner(bool(auto_tune_enabled), workers, stagger)
     pipeline_config = dict(post_registration or {})
     pipeline_config["pipeline_concurrency"] = workers
 
@@ -1928,6 +2027,12 @@ def _spawn_batch_runner(
         b["pause_requested"] = False
         b["concurrency"] = workers
         b["stagger_ms"] = stagger
+        b["scheduling_mode"] = "slot_fill"
+        b["auto_tune_enabled"] = bool(auto_tune_enabled)
+        b["auto_tune"] = tuner.snapshot(
+            successes=int(b.get("ok_count") or 0),
+            started_at=float(b.get("created_at") or _now()),
+        )
         b["runner_alive"] = True
         b["owner_pid"] = os.getpid()
         b["adapter_build"] = ADAPTER_BUILD
@@ -1944,6 +2049,7 @@ def _spawn_batch_runner(
             stagger_ms=stagger,
             mail_provider=mail_provider,
             post_registration=pipeline_config,
+            auto_tune_enabled=auto_tune_enabled,
         )
         b["reg_config"]["proxy_strategy"] = proxy_strat
         b["reg_config"]["proxy_pool_count"] = len(proxy_pool)
@@ -1979,13 +2085,15 @@ def _spawn_batch_runner(
         ok_n = int(_seed.get("ok_count") or 0)
         fail_n = int(_seed.get("fail_count") or 0)
         stop_renew = False
-        # Feed the pool gradually: only keep ~workers(+prefetch) jobs prepared
-        # at once. Submitting all remaining jobs up-front used to create hundreds
-        # of mailboxes immediately and made stop/cancel racey under multi-thread.
+        # Strict slot-fill scheduling: keep exactly the configured number of
+        # jobs in flight and submit the next one as soon as any slot completes.
         next_i = 1
         in_flight: dict[Any, int] = {}
-        prefetch = max(0, min(int(REG_PREFETCH_SLOTS), max(0, workers)))
-        max_inflight = max(1, workers + prefetch)
+
+        def _max_inflight() -> int:
+            if tuner.enabled:
+                return max(1, int(tuner.current_concurrency))
+            return max(1, workers)
 
         def _batch_cancel_requested() -> bool:
             with _lock:
@@ -2112,7 +2220,8 @@ def _spawn_batch_runner(
                 proxy_pool, strategy=proxy_strat, index=max(0, int(i) - 1)
             )
             # Small per-slot stagger only (not cumulative across the whole batch).
-            delay = (stagger / 1000.0) * ((i - 1) % max(1, workers))
+            active_slots = max(1, int(tuner.current_concurrency))
+            delay = (tuner.stagger_ms / 1000.0) * ((i - 1) % active_slots)
             prepared = _prepare_registration_session(
                 yescaptcha_key=key,
                 proxy=job_proxy,
@@ -2222,6 +2331,13 @@ def _spawn_batch_runner(
         def _note_result(idx: int, r: dict[str, Any] | None = None, exc: Exception | None = None) -> None:
             nonlocal finished, ok_n, fail_n
             finished += 1
+            result_ok = bool(isinstance(r, dict) and r.get("ok") and exc is None)
+            result_error = str(
+                exc
+                or ((r or {}).get("error") if isinstance(r, dict) else "")
+                or ((r or {}).get("status") if isinstance(r, dict) else "")
+                or ""
+            )
             if exc is not None:
                 fail_n += 1
                 errors.append(f"#{idx}: {exc}")
@@ -2235,6 +2351,12 @@ def _spawn_batch_runner(
                 errors.append(
                     f"#{idx}: {r.get('error') or r.get('status') or 'failed'}"
                 )
+            tuner.record(result_ok, result_error)
+            if tuner.ready:
+                solver_sample = (
+                    probe_local_solver(None, timeout=0.75) if provider == "local" else {}
+                )
+                tuner.evaluate(system_sample(), solver_sample)
             with _lock:
                 b = _batches.get(bid)
                 if b is not None:
@@ -2249,9 +2371,13 @@ def _spawn_batch_runner(
                     b["spawn_errors"] = errors[-20:]
                     b["runner_alive"] = True
                     b["inflight"] = len(in_flight)
+                    b["auto_tune"] = tuner.snapshot(
+                        successes=ok_n,
+                        started_at=float(b.get("created_at") or _now()),
+                    )
                     b["message"] = (
                         f"running {finished}/{target_total} done "
-                        f"(ok={ok_n} fail={fail_n}, threads={workers}, "
+                        f"(ok={ok_n} fail={fail_n}, threads={tuner.current_concurrency}, "
                         f"inflight={len(in_flight)})"
                     )
                     _mirror_reg_batch(bid, dict(b))
@@ -2262,10 +2388,10 @@ def _spawn_batch_runner(
                 max_workers=workers, thread_name_prefix=f"gba-batch-{bid[-6:]}"
             ) as pool:
                 while True:
-                    # Fill up to concurrency(+prefetch) only while not cancelled.
+                    # Fill every free slot immediately; no wave/batch barrier.
                     while (
                         next_i <= remaining
-                        and len(in_flight) < max_inflight
+                        and len(in_flight) < _max_inflight()
                         and not _batch_cancel_requested()
                         and not _batch_pause_requested()
                     ):
@@ -2281,7 +2407,7 @@ def _spawn_batch_runner(
                                     bb["status"] = "running"
                                 bb["message"] = (
                                     f"running {finished}/{target_total} done "
-                                    f"(ok={ok_n} fail={fail_n}, threads={workers}, "
+                                    f"(ok={ok_n} fail={fail_n}, threads={tuner.current_concurrency}, "
                                     f"inflight={len(in_flight)})"
                                 )
                                 _mirror_reg_batch(bid, dict(bb))
@@ -2335,6 +2461,10 @@ def _spawn_batch_runner(
                     b["spawn_errors"] = errors[-20:]
                     b["runner_alive"] = False
                     b["inflight"] = 0
+                    b["auto_tune"] = tuner.snapshot(
+                        successes=ok_n,
+                        started_at=float(b.get("created_at") or _now()),
+                    )
                     target_total = int(b.get("count") or finished or 0)
                     cancelled = bool(b.get("cancel_requested")) or str(b.get("status") or "").lower() in (
                         "stopping",
@@ -2349,34 +2479,34 @@ def _spawn_batch_runner(
                         b["status"] = "paused"
                         b["message"] = (
                             f"paused {finished}/{target_total} "
-                            f"(ok={ok_n} fail={fail_n}, threads={workers})"
+                            f"(ok={ok_n} fail={fail_n}, threads={tuner.current_concurrency})"
                         )
                     elif cancelled and finished < target_total:
                         b["status"] = "cancelled"
                         b["message"] = (
                             f"stopped {finished}/{target_total} "
-                            f"(ok={ok_n} fail={fail_n}, threads={workers})"
+                            f"(ok={ok_n} fail={fail_n}, threads={tuner.current_concurrency})"
                         )
                     elif fail_n and not ok_n:
                         b["status"] = "error"
                         b["error"] = "; ".join(errors[:5]) or "all failed"
                         b["message"] = (
                             f"finished {finished}/{target_total} "
-                            f"(ok={ok_n} fail={fail_n}, threads={workers})"
+                            f"(ok={ok_n} fail={fail_n}, threads={tuner.current_concurrency})"
                             + (f"; errors={len(errors)}" if errors else "")
                         )
                     elif fail_n:
                         b["status"] = "partial"
                         b["message"] = (
                             f"finished {finished}/{target_total} "
-                            f"(ok={ok_n} fail={fail_n}, threads={workers})"
+                            f"(ok={ok_n} fail={fail_n}, threads={tuner.current_concurrency})"
                             + (f"; errors={len(errors)}" if errors else "")
                         )
                     else:
                         b["status"] = "done"
                         b["message"] = (
                             f"finished {finished}/{target_total} "
-                            f"(ok={ok_n} fail={fail_n}, threads={workers})"
+                            f"(ok={ok_n} fail={fail_n}, threads={tuner.current_concurrency})"
                         )
                     _mirror_reg_batch(bid, dict(b))
                     st = str(b.get("status") or "done")
@@ -2392,13 +2522,14 @@ def _spawn_batch_runner(
                             "batch_id": bid,
                             "ok_count": ok_n,
                             "fail_count": fail_n,
-                            "threads": workers,
+                            "threads": tuner.current_concurrency,
                             "status": st,
                             "errors": (errors or [])[:10],
                             "phase": "finished",
                             "adapter_build": ADAPTER_BUILD,
                         },
                     )
+            _close_pipeline_phase(bid, "probe")
             _close_pipeline_phase(bid, "import")
             _release_batch_runner(bid, lock_token)
 
@@ -2413,6 +2544,10 @@ def _spawn_batch_runner(
         "batch_id": bid,
         "remaining": remaining,
         "concurrency": workers,
+        "auto_tune": tuner.snapshot(
+            successes=int(batch.get("ok_count") or 0),
+            started_at=float(batch.get("created_at") or _now()),
+        ),
         "message": f"started batch {bid}: remaining={remaining} threads={workers}",
     }
 
@@ -2523,10 +2658,30 @@ def _run_registration(
                 "imported",
             ):
                 raise _RegCancelled(cur.get("message") or "cancelled by user")
+            now = _now()
+            previous_status = str(cur.get("_phase_status") or "")
+            previous_started = float(cur.get("_phase_started_at") or 0.0)
+            if previous_status and previous_status != status and previous_started > 0:
+                stage = _REGISTRATION_STAGE_BY_STATUS.get(previous_status)
+                if stage:
+                    durations = dict(cur.get("phase_durations") or {})
+                    durations[stage] = round(
+                        float(durations.get(stage) or 0.0) + max(0.0, now - previous_started),
+                        3,
+                    )
+                    cur["phase_durations"] = durations
+            if status in _REGISTRATION_STAGE_BY_STATUS:
+                if previous_status != status:
+                    cur["_phase_status"] = status
+                    cur["_phase_started_at"] = now
+            else:
+                cur.pop("_phase_status", None)
+                cur.pop("_phase_started_at", None)
             cur["status"] = status
             cur["message"] = message
-            cur["updated_at"] = _now()
+            cur["updated_at"] = now
             cur.update(kwargs)
+            _append_session_event(cur, status, message, at=now)
             _sessions[sid] = cur
             _mirror_reg_sess(sid, cur)
 
@@ -2677,9 +2832,8 @@ def _run_registration(
         _check_cancel()
 
         def _solve_turnstile(url: str, *, premium: bool = True) -> Any:
-            # Local inline solver is single-process and browser-backed; concurrent
-            # createTask storms from many registration workers cause timeouts /
-            # mixed results. Serialize local solves while keeping YesCaptcha parallel.
+            # Bound local solves to the configured Camoufox browser slots while
+            # keeping YesCaptcha requests independently parallel.
             # Local Camoufox has no premium tier — force Proxyless only.
             use_premium = bool(premium) and provider != "local"
             kwargs = {
@@ -2689,7 +2843,7 @@ def _run_registration(
                 "fallback_non_premium": True,
             }
             if provider == "local":
-                with _local_captcha_lock:
+                with _local_captcha_slots:
                     _check_cancel()
                     try:
                         return solver.solve_turnstile(**kwargs)
@@ -2874,7 +3028,7 @@ def _run_registration(
             # Persist full body for offline diagnosis (truncated).
             try:
                 debug_path = (
-                    ROOT / "data" / "register_sso" / f"{sid}.create_account.rsc.txt"
+                    RUNTIME_DATA_DIR / "register_sso" / f"{sid}.create_account.rsc.txt"
                 )
                 debug_path.parent.mkdir(parents=True, exist_ok=True)
                 debug_path.write_text(rsc_body[:200_000], encoding="utf-8")
@@ -2925,7 +3079,11 @@ def _run_registration(
         sso = None
         try:
             sso = client.fetch_sso_token(
-                email=email, password=password, save=True, retries=4
+                email=email,
+                password=password,
+                save=True,
+                output_dir=str(RUNTIME_DATA_DIR / "sso_output"),
+                retries=4,
             )
         except Exception as sso_fetch_err:  # noqa: BLE001
             print(f"[grok-build-auth] fetch_sso_token error: {sso_fetch_err}")
@@ -3115,6 +3273,7 @@ def _run_registration(
             _enqueue_pipeline_phase(sid, "import")
         else:
             _finish_pipeline_without_import(sid, pipeline_cfg)
+        _enqueue_pipeline_phase(sid, "probe")
         return
     except _RegCancelled as exc:
         with _lock:
@@ -3446,6 +3605,7 @@ def resume_registration_batch(
         expiry_ms=cfg.get("expiry_ms"),
         mail_provider=mail_provider,
         post_registration=cfg.get("post_registration") if isinstance(cfg.get("post_registration"), dict) else None,
+        auto_tune_enabled=bool(cfg.get("auto_tune_enabled")),
     )
     out = {
         "ok": bool(spawned.get("ok")),
@@ -3459,6 +3619,29 @@ def resume_registration_batch(
     if not out["ok"]:
         out["error"] = spawned.get("error") or "spawn failed"
     return out
+
+
+def get_registration_performance_profile(
+    provider: str | None = None,
+    local_solver_url: str | None = None,
+) -> dict[str, Any]:
+    selected = str(provider or CAPTCHA_PROVIDER or "local").strip().lower()
+    solver: dict[str, Any] = {}
+    solver_threads = None
+    if selected == "local":
+        solver = probe_local_solver(local_solver_url, timeout=0.75)
+        try:
+            solver_threads = int(solver.get("thread") or 0) or None
+        except (TypeError, ValueError):
+            solver_threads = None
+    profile = machine_profile(
+        provider=selected,
+        solver_threads=solver_threads,
+        local_slots=_LOCAL_CAPTCHA_CONCURRENCY if selected == "local" else None,
+        global_limit=_GLOBAL_REG_INFLIGHT_MAX,
+    )
+    profile["solver"] = solver
+    return profile
 
 
 def pause_registration_batch(batch_id: str) -> dict[str, Any]:
@@ -3495,11 +3678,51 @@ def pause_registration_batch(batch_id: str) -> dict[str, Any]:
     }
 
 
+def _schedule_probe_recheck(
+    sid: str,
+    config: dict[str, Any],
+    *,
+    current_attempt: int,
+    next_attempt: int,
+    delay: float,
+) -> None:
+    def run() -> None:
+        sess = _load_reg_sess(sid) or {}
+        probe = sess.get("probe") if isinstance(sess.get("probe"), dict) else {}
+        if (
+            str(probe.get("state") or "").lower() != "retry_pending"
+            or int(probe.get("recheck_attempt") or 0) != current_attempt
+            or _session_cancel_requested(sess)
+        ):
+            return
+        group = _pipeline_group(sess)
+        limit = max(
+            1,
+            min(
+                MAX_CONCURRENCY,
+                int(config.get("probe_concurrency") or config.get("pipeline_concurrency") or 1),
+            ),
+        )
+        with _probe_group_slots(group, limit):
+            _retry_probe_now(
+                sid,
+                config,
+                manual_retry=False,
+                recheck_attempt=next_attempt,
+            )
+
+    timer = threading.Timer(max(1.0, float(delay)), run)
+    timer.daemon = True
+    timer.name = f"gba-probe-recheck-{sid[-8:]}-{next_attempt}"
+    timer.start()
+
+
 def _retry_probe_now(
     session_id: str,
     post_registration: dict[str, Any] | None = None,
     *,
     manual_retry: bool = True,
+    recheck_attempt: int = 0,
 ) -> dict[str, Any]:
     sid = str(session_id or "").strip()
     sess = _load_reg_sess(sid)
@@ -3510,17 +3733,29 @@ def _retry_probe_now(
         return {"ok": False, "error": "该会话没有可测活的注册账号"}
     with _lock:
         current = _sessions.get(sid) or dict(sess)
-        current["status"] = "probing"
-        current["message"] = "正在手动重试测活" if manual_retry else "正在执行队列测活"
+        probe = dict(current.get("probe") or {})
+        probe.update(
+            {
+                "state": "running",
+                "queued": False,
+                "position": 0,
+                "recheck_attempt": max(0, int(recheck_attempt)),
+            }
+        )
+        probe.pop("next_recheck_at", None)
+        current["probe"] = probe
+        message = "正在手动重试测活" if manual_retry else "正在执行队列测活"
         current["updated_at"] = _now()
+        if manual_retry:
+            _append_session_event(current, "probing", message, at=current["updated_at"])
         _sessions[sid] = current
         _mirror_reg_sess(sid, current)
     results: list[dict[str, Any]] = []
+    config = dict(sess.get("_post_registration") or {})
+    config.update(dict(post_registration or {}))
     try:
         import model_health
 
-        config = dict(sess.get("_post_registration") or {})
-        config.update(dict(post_registration or {}))
         model = str(config.get("model") or "grok-4.5")
         for account_id in account_ids:
             try:
@@ -3542,6 +3777,12 @@ def _retry_probe_now(
                         "model": detail.get("model") or model,
                         "status_code": detail.get("status_code"),
                         "latency_ms": detail.get("latency_ms"),
+                        "retryable": bool(detail.get("retryable")),
+                        "classification": detail.get("classification"),
+                        "fallback": detail.get("fallback"),
+                        "degraded": bool(detail.get("degraded")),
+                        "chat_ready": detail.get("chat_ready"),
+                        "message": detail.get("message"),
                         "error": str(error)[:180] if error else None,
                     }
                 )
@@ -3549,27 +3790,68 @@ def _retry_probe_now(
                 results.append({"account_id": account_id, "ok": False, "error": str(exc)[:180]})
     except Exception as exc:  # noqa: BLE001
         results.append({"account_id": None, "ok": False, "error": str(exc)[:180]})
+    uncertain = sum(1 for item in results if item.get("retryable") and not item.get("ok"))
+    failed = sum(1 for item in results if not item.get("ok") and not item.get("retryable"))
+    degraded = sum(1 for item in results if item.get("ok") and item.get("degraded"))
     summary = {
         "count": len(results),
         "ok": sum(1 for item in results if item.get("ok")),
-        "fail": sum(1 for item in results if not item.get("ok")),
+        "fail": failed,
+        "uncertain": uncertain,
+        "degraded": degraded,
         "results": results,
+        "state": "complete",
+        "queued": False,
+        "position": 0,
+        "recheck_attempt": max(0, int(recheck_attempt)),
     }
+    recheck_delay = None
+    if uncertain:
+        if recheck_attempt < len(PROBE_RECHECK_DELAYS):
+            recheck_delay = PROBE_RECHECK_DELAYS[recheck_attempt]
+            summary["state"] = "retry_pending"
+            summary["next_recheck_at"] = _now() + recheck_delay
+        else:
+            summary["state"] = "uncertain"
     if manual_retry:
         summary["manual_retry"] = True
     with _lock:
         current = _sessions.get(sid) or dict(sess)
         current["probe"] = summary
-        current["status"] = "imported" if manual_retry else "probe_complete"
-        current["message"] = (
-            f"手动测活完成：通过 {summary['ok']}，失败 {summary['fail']}"
-            if manual_retry
-            else f"队列测活完成：通过 {summary['ok']}，失败 {summary['fail']}"
-        )
+        if summary["state"] == "retry_pending":
+            message = (
+                f"测活暂未确认：通过 {summary['ok']}，待复检 {summary['uncertain']}，"
+                f"将在 {int(recheck_delay or 0)} 秒后自动复检"
+            )
+            event_status = "probe_retry_pending"
+        elif summary["state"] == "uncertain":
+            message = f"测活检测异常：通过 {summary['ok']}，无法确认 {summary['uncertain']}"
+            event_status = "probe_uncertain"
+        else:
+            degraded_text = f"，其中轻量验证 {summary['degraded']}" if summary["degraded"] else ""
+            message = (
+                f"手动测活完成：通过 {summary['ok']}，失败 {summary['fail']}{degraded_text}"
+                if manual_retry
+                else f"队列测活完成：通过 {summary['ok']}，失败 {summary['fail']}{degraded_text}"
+            )
+            event_status = "probe_complete"
         current["updated_at"] = _now()
+        _append_session_event(current, event_status, message, at=current["updated_at"])
         _sessions[sid] = current
         _mirror_reg_sess(sid, current)
-    return {"ok": summary["fail"] == 0, "session_id": sid, "probe": summary}
+    if recheck_delay is not None:
+        _schedule_probe_recheck(
+            sid,
+            config,
+            current_attempt=max(0, int(recheck_attempt)),
+            next_attempt=max(0, int(recheck_attempt)) + 1,
+            delay=recheck_delay,
+        )
+    return {
+        "ok": summary["fail"] == 0 and summary["uncertain"] == 0,
+        "session_id": sid,
+        "probe": summary,
+    }
 
 
 def retry_registration_probe(
@@ -3579,7 +3861,8 @@ def retry_registration_probe(
     sess = _load_reg_sess(sid)
     if not sess:
         return {"ok": False, "error": "registration session not found"}
-    if str(sess.get("status") or "").lower() == "probing":
+    probe = sess.get("probe") if isinstance(sess.get("probe"), dict) else {}
+    if str(probe.get("state") or "").lower() in {"running", "retry_pending"}:
         return {"ok": True, "session_id": sid, "already_running": True}
     threading.Thread(
         target=_retry_probe_now,
@@ -3600,12 +3883,15 @@ def retry_registration_batch_probe(
     candidates: list[str] = []
     for sid in batch.get("session_ids") or []:
         sess = _load_reg_sess(str(sid)) or {}
-        status = str(sess.get("status") or "").lower()
         probe = sess.get("probe") if isinstance(sess.get("probe"), dict) else {}
         if (
-            status != "probing"
+            str(probe.get("state") or "").lower() not in {"running", "retry_pending"}
             and (sess.get("imported_account_ids") or [])
-            and (not probe or int(probe.get("fail") or 0) > 0)
+            and (
+                not probe
+                or int(probe.get("fail") or 0) > 0
+                or int(probe.get("uncertain") or 0) > 0
+            )
         ):
             candidates.append(str(sid))
 
@@ -3666,6 +3952,9 @@ def _retry_import_now(
             else f"正在执行队列导入 {'CPA' if target == 'cpa' else 'Sub2API'}"
         )
         current["updated_at"] = _now()
+        _append_session_event(
+            current, current["status"], current["message"], at=current["updated_at"]
+        )
         _sessions[sid] = current
         _mirror_reg_sess(sid, current)
     results: list[dict[str, Any]] = []
@@ -3721,6 +4010,9 @@ def _retry_import_now(
             "concurrency": int(config.get("pipeline_concurrency") or 1),
         }
         current["updated_at"] = _now()
+        _append_session_event(
+            current, current["status"], current["message"], at=current["updated_at"]
+        )
         _sessions[sid] = current
         _mirror_reg_sess(sid, current)
     return {"ok": bool(auto_import["ok"]), "session_id": sid, "auto_import": auto_import}

@@ -1,4 +1,7 @@
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$LegacyAppRoot = Join-Path $Root "app"
+$PidDir = Join-Path (Join-Path $Root "runtime") "pids"
+$LegacyPidDir = Join-Path (Join-Path $LegacyAppRoot "runtime") "pids"
 
 function Stop-ProcessTree([int]$ProcessId) {
     $children = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
@@ -10,9 +13,15 @@ function Stop-ProcessTree([int]$ProcessId) {
     Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
 }
 
-foreach ($name in @(".app.pid", ".solver.pid")) {
-    $path = Join-Path $Root $name
-    if (Test-Path -LiteralPath $path) {
+foreach ($location in @(
+    @{ Base = $PidDir; Names = @("app.pid", "main.pid", "solver.pid", "startup.pid") },
+    @{ Base = $LegacyPidDir; Names = @("app.pid", "main.pid", "solver.pid", "startup.pid") },
+    @{ Base = $LegacyAppRoot; Names = @(".app.pid", ".main.pid", ".solver.pid", ".startup.pid") },
+    @{ Base = $Root; Names = @(".app.pid", ".main.pid", ".solver.pid", ".startup.pid") }
+)) {
+    foreach ($name in $location.Names) {
+        $path = Join-Path $location.Base $name
+        if (-not (Test-Path -LiteralPath $path)) { continue }
         $raw = (Get-Content -LiteralPath $path -Raw).Trim()
         if ($raw -match '^\d+$') {
             Stop-ProcessTree ([int]$raw)

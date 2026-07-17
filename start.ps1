@@ -1,5 +1,9 @@
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$BackendRoot = Join-Path $Root "backend"
+$RuntimeRoot = Join-Path $Root "runtime"
+$VendorRoot = Join-Path $Root "vendor"
+$PidDir = Join-Path $RuntimeRoot "pids"
 $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
 
@@ -41,10 +45,33 @@ function Ensure-Venv([string]$Path, [string]$Requirements, [string]$BasePython) 
     return $Python
 }
 
+function Resolve-SolverThreads {
+    $configured = 0
+    if ([int]::TryParse($env:PROGROK_SOLVER_THREADS, [ref]$configured) -and $configured -ge 1) {
+        return [Math]::Min(10, $configured)
+    }
+    try {
+        $physicalCores = (Get-CimInstance Win32_Processor | Measure-Object NumberOfCores -Sum).Sum
+        $freeMemoryGB = (Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1MB
+        $cpuCap = [Math]::Max(1, [Math]::Floor([double]$physicalCores * 0.75))
+        $memoryCap = [Math]::Max(1, [Math]::Floor([double]$freeMemoryGB / 0.6))
+        return [int](($cpuCap, $memoryCap, 8 | Measure-Object -Minimum).Minimum)
+    } catch {
+        return 3
+    }
+}
+
 $BasePython = Resolve-BasePython
-$MainPython = Ensure-Venv (Join-Path $Root ".venv") (Join-Path $Root "requirements.txt") $BasePython
-$SolverRoot = Join-Path $Root "turnstile-solver"
+$SolverThreads = Resolve-SolverThreads
+$env:GROK2API_LOCAL_CAPTCHA_CONCURRENCY = "$SolverThreads"
+if (-not $env:GROK2API_REG_GLOBAL_INFLIGHT) {
+    $env:GROK2API_REG_GLOBAL_INFLIGHT = "$SolverThreads"
+}
+Write-Host "Recommended registration capacity: $SolverThreads"
+$MainPython = Ensure-Venv (Join-Path $RuntimeRoot ".venv") (Join-Path $BackendRoot "requirements.txt") $BasePython
+$SolverRoot = Join-Path $VendorRoot "turnstile-solver"
 $SolverPython = Ensure-Venv (Join-Path $SolverRoot ".venv") (Join-Path $SolverRoot "requirements.txt") $BasePython
+New-Item -ItemType Directory -Force -Path $PidDir | Out-Null
 
 $SolverUp = $false
 try {
@@ -53,13 +80,17 @@ try {
 } catch {}
 
 if (-not $SolverUp) {
+    # Eager Camoufox prewarm + page reuse (override with env if needed).
+    if (-not $env:TURNSTILE_LAZY) { $env:TURNSTILE_LAZY = "0" }
+    if (-not $env:TURNSTILE_REUSE_PAGE) { $env:TURNSTILE_REUSE_PAGE = "1" }
+    if (-not $env:TURNSTILE_IDLE_SEC) { $env:TURNSTILE_IDLE_SEC = "600" }
     & $SolverPython -m camoufox fetch
     $solver = Start-Process -FilePath $SolverPython -ArgumentList @(
-        "api_solver.py", "--browser_type", "camoufox", "--thread", "1",
+        "api_solver.py", "--browser_type", "camoufox", "--thread", "$SolverThreads",
         "--proxy", "--host", "127.0.0.1", "--port", "5072"
     ) -WorkingDirectory $SolverRoot -WindowStyle Hidden -PassThru
-    $solver.Id | Set-Content -LiteralPath (Join-Path $Root ".solver.pid") -Encoding ascii
-    Write-Host "Turnstile Solver started: PID=$($solver.Id), port=5072"
+    $solver.Id | Set-Content -LiteralPath (Join-Path $PidDir "solver.pid") -Encoding ascii
+    Write-Host "Turnstile Solver started: PID=$($solver.Id), port=5072 (prewarm, reuse_page, idle=$($env:TURNSTILE_IDLE_SEC)s)"
 } else {
     Write-Host "Turnstile Solver already available on port 5072"
 }
@@ -71,12 +102,12 @@ try {
 } catch {}
 
 if (-not $AppUp) {
-    $LogDir = Join-Path $Root "logs"
+    $LogDir = Join-Path $RuntimeRoot "logs"
     New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
     $app = Start-Process -FilePath $MainPython -ArgumentList @(
         "-m", "uvicorn", "app:app", "--host", "127.0.0.1", "--port", "3080", "--workers", "1"
-    ) -WorkingDirectory $Root -WindowStyle Hidden -RedirectStandardOutput (Join-Path $LogDir "app.out.log") -RedirectStandardError (Join-Path $LogDir "app.err.log") -PassThru
-    $app.Id | Set-Content -LiteralPath (Join-Path $Root ".app.pid") -Encoding ascii
+    ) -WorkingDirectory $BackendRoot -WindowStyle Hidden -RedirectStandardOutput (Join-Path $LogDir "app.out.log") -RedirectStandardError (Join-Path $LogDir "app.err.log") -PassThru
+    $app.Id | Set-Content -LiteralPath (Join-Path $PidDir "app.pid") -Encoding ascii
     Write-Host "ProGrok started: PID=$($app.Id), http://127.0.0.1:3080"
 } else {
     Write-Host "ProGrok already available: http://127.0.0.1:3080"
