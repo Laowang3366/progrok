@@ -1,6 +1,7 @@
 $ErrorActionPreference = "Stop"
-$Root = [IO.Path]::GetFullPath((Split-Path -Parent $MyInvocation.MyCommand.Path))
-$ReleaseRoot = [IO.Path]::GetFullPath((Join-Path $Root "release"))
+$ToolsRoot = [IO.Path]::GetFullPath((Split-Path -Parent $MyInvocation.MyCommand.Path))
+$Root = [IO.Path]::GetFullPath((Split-Path -Parent $ToolsRoot))
+$ReleaseRoot = [IO.Path]::GetFullPath((Join-Path $Root "artifacts\release"))
 $Stage = [IO.Path]::GetFullPath((Join-Path $ReleaseRoot "progrok-windows"))
 $Zip = Join-Path $ReleaseRoot ("progrok-windows-{0}.zip" -f (Get-Date -Format "yyyyMMdd"))
 
@@ -11,6 +12,15 @@ function Assert-ChildPath([string]$Path, [string]$Parent) {
     }
 }
 
+function Copy-SelectedFiles([string]$SourceRoot, [string]$DestinationRoot, [string[]]$Names) {
+    New-Item -ItemType Directory -Force -Path $DestinationRoot | Out-Null
+    foreach ($name in $Names) {
+        $source = Join-Path $SourceRoot $name
+        if (-not (Test-Path -LiteralPath $source)) { throw "Missing release file: $source" }
+        Copy-Item -LiteralPath $source -Destination (Join-Path $DestinationRoot $name)
+    }
+}
+
 Assert-ChildPath $Stage $ReleaseRoot
 New-Item -ItemType Directory -Force -Path $ReleaseRoot | Out-Null
 if (Test-Path -LiteralPath $Stage) {
@@ -18,24 +28,30 @@ if (Test-Path -LiteralPath $Stage) {
 }
 New-Item -ItemType Directory -Force -Path $Stage | Out-Null
 
-$TopFiles = @(
-    ".env.example", ".gitignore", "README.md", "requirements.txt",
-    "account_pipeline.py", "accounts.py", "app.py", "config.py",
-    "export_formats.py", "grok_build_adapter.py", "model_health.py",
-    "moemail.py", "proxy_pool.py", "sso_to_auth_json.py",
-    "install_and_start.cmd", "install_and_start.ps1",
-    "start.cmd", "start.ps1", "stop.cmd", "stop.ps1",
-    "build_release.ps1"
+Copy-SelectedFiles $Root $Stage @(
+    ".gitignore", "README.md", "install_and_start.cmd", "install_and_start.ps1",
+    "start.cmd", "start.ps1", "stop.cmd", "stop.ps1"
 )
 
-foreach ($name in $TopFiles) {
-    $source = Join-Path $Root $name
-    if (-not (Test-Path -LiteralPath $source)) { throw "Missing release file: $name" }
-    Copy-Item -LiteralPath $source -Destination (Join-Path $Stage $name)
-}
+Copy-SelectedFiles (Join-Path $Root "backend") (Join-Path $Stage "backend") @(
+    "account_pipeline.py", "accounts.py", "app.py", "config.py", "export_formats.py",
+    "grok_build_adapter.py", "model_health.py", "moemail.py", "performance_tuning.py",
+    "proxy_pool.py", "requirements.txt", "sso_to_auth_json.py"
+)
+Copy-SelectedFiles (Join-Path $Root "web\static") (Join-Path $Stage "web\static") @(
+    "app.js", "index.html", "style.css"
+)
+Copy-SelectedFiles (Join-Path $Root "config") (Join-Path $Stage "config") @(
+    ".env.example"
+)
+Copy-SelectedFiles (Join-Path $Root "tools") (Join-Path $Stage "tools") @(
+    "build_release.ps1"
+)
+Copy-SelectedFiles (Join-Path $Root "tests") (Join-Path $Stage "tests") @(
+    "test_account_pipeline.py", "test_performance_tuning.py"
+)
 
-$DirectoryFiles = [ordered]@{
-    "static" = @("app.js", "index.html", "style.css")
+$VendorFiles = [ordered]@{
     "turnstile-solver" = @("api_solver.py", "browser_configs.py", "db_results.py", "requirements.txt")
     "grok-build-auth" = @("LICENSE", "NOTICE", "requirements.txt", "run.py")
     "grok-build-auth\alias_mail" = @("alias_mail.py")
@@ -45,21 +61,17 @@ $DirectoryFiles = [ordered]@{
         "tempmail_transport.py", "xai_oauth.py"
     )
 }
-
-foreach ($entry in $DirectoryFiles.GetEnumerator()) {
-    $destination = Join-Path $Stage $entry.Key
-    New-Item -ItemType Directory -Force -Path $destination | Out-Null
-    foreach ($name in $entry.Value) {
-        $source = Join-Path (Join-Path $Root $entry.Key) $name
-        if (-not (Test-Path -LiteralPath $source)) { throw "Missing release file: $($entry.Key)\$name" }
-        Copy-Item -LiteralPath $source -Destination (Join-Path $destination $name)
-    }
+foreach ($entry in $VendorFiles.GetEnumerator()) {
+    $source = Join-Path (Join-Path $Root "vendor") $entry.Key
+    $destination = Join-Path (Join-Path $Stage "vendor") $entry.Key
+    Copy-SelectedFiles $source $destination $entry.Value
 }
 
 $ForbiddenFiles = @(Get-ChildItem -LiteralPath $Stage -File -Recurse | Where-Object {
+    $relativePath = $_.FullName.Substring($Stage.Length)
     $_.Name -match '(?i)^(config\.json|\.env)$' -or
     $_.Name -match '(?i)(credential|secret)' -or
-    $_.FullName -match '(?i)\\(data|logs|output|\.venv|__pycache__)\\'
+    $relativePath -match '(?i)\\(runtime|artifacts|logs|output|\.venv|__pycache__)\\'
 })
 if ($ForbiddenFiles.Count -gt 0) {
     throw "Release contains forbidden local files."
@@ -68,7 +80,7 @@ if ($ForbiddenFiles.Count -gt 0) {
 $TextFiles = @(Get-ChildItem -LiteralPath $Stage -File -Recurse | Where-Object {
     $_.Extension -in @('.py', '.js', '.html', '.css', '.md', '.ps1', '.cmd', '.txt', '.json', '.example')
 })
-$LocalConfig = Join-Path $Root "config.json"
+$LocalConfig = Join-Path $Root "config\config.json"
 if (Test-Path -LiteralPath $LocalConfig) {
     $SensitiveKeys = @(
         "mail_api_key", "mail_base_url", "mail_domain", "yescaptcha_key",

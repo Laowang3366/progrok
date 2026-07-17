@@ -8,11 +8,12 @@ from typing import Any
 from account_pipeline import DEFAULT_PROBE_MODEL, probe_account
 
 
-ROOT = Path(__file__).resolve().parent
+APP_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = APP_DIR / "runtime" / "data"
 
 
 def _load_record(account_id: str) -> dict[str, Any]:
-    for path in (ROOT / "data" / "accounts").glob("*.json"):
+    for path in (DATA_DIR / "accounts").glob("*.json"):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
@@ -21,7 +22,7 @@ def _load_record(account_id: str) -> dict[str, Any]:
             continue
         if data.get("type") == "xai" and str(data.get("sub") or "") == account_id:
             return data
-    merged_path = ROOT / "data" / "auth.json"
+    merged_path = DATA_DIR / "auth.json"
     try:
         merged = json.loads(merged_path.read_text(encoding="utf-8"))
     except Exception:

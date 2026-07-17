@@ -4,8 +4,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
-DATA_DIR = ROOT / "data"
+APP_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = APP_DIR / "runtime" / "data"
 AUTH_FILE = DATA_DIR / "auth.json"
 
 MOEMAIL_API_KEY = os.getenv("GROK2API_MOEMAIL_API_KEY", os.getenv("MOEMAIL_API_KEY", ""))

@@ -8,7 +8,7 @@
   <meta http-equiv="Expires" content="0">
   <title>ProGrok 协议注册</title>
   <link rel="icon" href="data:,">
-  <link rel="stylesheet" href="/static/style.css?v=20260715-4">
+  <link rel="stylesheet" href="/static/style.css?v=20260717-8">
 </head>
 <body>
   <main>
@@ -28,6 +28,17 @@
             <div id="paths-list" class="paths-list"><div class="paths-loading">正在读取路径…</div></div>
           </div>
         </div>
+        <div class="download-control">
+          <button type="button" id="download-button" class="path-button">账号下载</button>
+          <div id="download-popover" class="paths-popover download-popover" hidden>
+            <div class="paths-head"><strong>账号下载</strong><button type="button" id="download-close" class="paths-close" aria-label="关闭">×</button></div>
+            <div class="download-bar">
+              <label>下载格式<select id="download-format"><option value="pure_sso">纯 SSO</option><option value="cookie">sso=...</option><option value="email_sso">邮箱 + SSO</option><option value="email_password_sso">邮箱:密码:SSO</option><option value="json">普通 JSON（邮箱 + 密码）</option><option value="cpa_json" selected>CPA JSON</option><option value="sub2api_json">Sub2API JSON</option></select></label>
+              <label>下载范围<select id="download-batch"><option value="">全部成功账号</option></select></label>
+              <button type="button" id="download-accounts" class="download-button">下载账号</button>
+            </div>
+          </div>
+        </div>
         <div id="health" class="badge">检查服务…</div>
       </div>
     </header>
@@ -41,6 +52,7 @@
           <input id="manual-import-file" type="file" accept=".json,application/json" multiple hidden>
           <button type="button" id="manual-import-button" class="secondary">手动导入 JSON</button>
           <button type="button" id="save" class="secondary">保存配置</button>
+          <button type="button" id="pause-current" class="pause-current" disabled>暂停注册</button>
           <button type="submit" id="start" form="config-form">开始注册</button>
         </div>
       </div>
@@ -50,6 +62,8 @@
           <label>注册数量<input name="count" type="number" min="1" max="10000"></label>
           <label>并发数<input name="concurrency" type="number" min="1" max="10"></label>
           <label>错峰毫秒<input name="stagger_ms" type="number" min="0" max="60000"></label>
+          <label class="tune-toggle"><span>自动调优错峰</span><input name="auto_tune_enabled" type="checkbox"></label>
+          <div id="performance-profile" class="performance-profile wide">正在评估本机性能…</div>
         </div>
         <div class="section-title"><span>01</span> 邮箱服务</div>
         <div class="grid">
@@ -99,23 +113,44 @@
     <div class="side-column">
     <section class="panel results log-panel">
       <div class="results-head">
-        <div><div class="section-title"><span>05</span> 实时日志</div><p id="summary">暂无任务</p></div>
+        <div><div class="section-title"><span>05</span> 实时信息流</div><p id="summary">暂无任务</p></div>
         <div class="results-actions"><button id="reset-round" class="ghost reset-round">清除本轮</button><button id="refresh" class="ghost">立即刷新</button></div>
       </div>
-      <div id="tasks" class="tasks"><div class="empty">启动任务后会在这里显示实时进度</div></div>
-    </section>
-    <section class="panel download-panel">
-      <div class="section-title"><span>06</span> 账号下载</div>
-      <div class="download-bar">
-        <label>下载格式<select id="download-format"><option value="pure_sso">纯 SSO</option><option value="cookie">sso=...</option><option value="email_sso">邮箱 + SSO</option><option value="email_password_sso">邮箱:密码:SSO</option><option value="json">普通 JSON（邮箱 + 密码）</option><option value="cpa_json" selected>CPA JSON</option><option value="sub2api_json">Sub2API JSON</option></select></label>
-        <label>下载范围<select id="download-batch"><option value="">全部成功账号</option></select></label>
-        <button type="button" id="download-accounts" class="download-button">下载账号</button>
+      <div class="monitor-stats">
+        <div class="monitor-stat success"><span>注册成功</span><strong id="stat-register-ok">0</strong></div>
+        <div class="monitor-stat danger"><span>注册失败</span><strong id="stat-register-fail">0</strong></div>
+        <div class="monitor-stat"><span>注册成功率</span><strong id="stat-register-rate">--</strong></div>
+        <div class="monitor-stat success"><span>已导入</span><strong id="stat-import-ok">0</strong></div>
+        <div class="monitor-stat danger"><span>导入失败</span><strong id="stat-import-fail">0</strong></div>
+        <div class="monitor-stat"><span>导入成功率</span><strong id="stat-import-rate">--</strong></div>
+        <div class="monitor-stat success"><span>测活成功</span><strong id="stat-probe-ok">0</strong></div>
+        <div class="monitor-stat danger"><span>测活失败</span><strong id="stat-probe-fail">0</strong></div>
+        <div class="monitor-stat"><span>测活成功率</span><strong id="stat-probe-rate">--</strong></div>
       </div>
+      <div class="activity-label"><span>步骤动态</span><small id="activity-count">0 条</small></div>
+      <div id="tasks" class="tasks activity-feed"><div class="empty">启动任务后会在这里逐步显示注册动态</div></div>
     </section>
     </div>
     </div>
   </main>
+  <div id="concurrency-warning" class="safety-modal" role="dialog" aria-modal="true" aria-labelledby="concurrency-warning-title" hidden>
+    <div class="safety-dialog">
+      <div class="safety-icon">!</div>
+      <h2 id="concurrency-warning-title">高并发安全提醒</h2>
+      <p>当前注册并发为 <strong id="concurrency-warning-value">--</strong>。并发超过 3 可能增加过盾失败、链路阻塞和账号风控概率，请确认本机 Solver 与代理资源能够承受。</p>
+      <div class="safety-performance">
+        <span>当前电脑性能评估</span>
+        <strong id="concurrency-performance-summary">正在读取性能信息…</strong>
+        <small id="concurrency-performance-advice"></small>
+      </div>
+      <div class="safety-actions">
+        <button type="button" id="concurrency-warning-cancel" class="secondary">返回调整</button>
+        <button type="button" id="concurrency-warning-continue" class="secondary">仅本次继续</button>
+        <button type="button" id="concurrency-warning-remember">继续并记住，下次不再提醒</button>
+      </div>
+    </div>
+  </div>
   <div id="toast" role="status" aria-live="polite"></div>
-  <script src="/static/app.js?v=20260716-9"></script>
+  <script src="/static/app.js?v=20260717-8"></script>
 </body>
 </html>

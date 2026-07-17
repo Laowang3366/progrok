@@ -12,8 +12,8 @@ from typing import Any
 
 from export_formats import build_cpa_record, build_sub2api_payload, cpa_filename
 
-ROOT = Path(__file__).resolve().parent
-DATA_DIR = ROOT / "data"
+APP_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = APP_DIR / "runtime" / "data"
 ACCOUNTS_DIR = DATA_DIR / "accounts"
 MERGED_AUTH = DATA_DIR / "auth.json"
 _lock = threading.RLock()

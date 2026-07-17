@@ -74,15 +74,18 @@ class TurnstileAPIServer:
         self.browser_version = browser_version
         self.console = Console()
 
-        # Lazy pool: do not keep Camoufox/Chromium warm while idle.
-        # TURNSTILE_LAZY=1 (default) starts browsers on first solve request.
-        # TURNSTILE_IDLE_SEC (default 180) reclaims the pool after quiet period.
-        lazy_raw = (os.getenv("TURNSTILE_LAZY", "1") or "1").strip().lower()
+        # TURNSTILE_LAZY=0 (default) prewarms browser pool at startup.
+        # TURNSTILE_LAZY=1 defers browser start until first solve.
+        # TURNSTILE_IDLE_SEC (default 600) reclaims the pool after quiet period.
+        # TURNSTILE_REUSE_PAGE=1 (default) reuses context/page per browser slot.
+        lazy_raw = (os.getenv("TURNSTILE_LAZY", "0") or "0").strip().lower()
         self.lazy_browsers = lazy_raw not in ("0", "false", "no", "off")
+        reuse_raw = (os.getenv("TURNSTILE_REUSE_PAGE", "1") or "1").strip().lower()
+        self.reuse_pages = reuse_raw not in ("0", "false", "no", "off")
         try:
-            self.idle_sec = float(os.getenv("TURNSTILE_IDLE_SEC", "180") or 180)
+            self.idle_sec = float(os.getenv("TURNSTILE_IDLE_SEC", "600") or 600)
         except (TypeError, ValueError):
-            self.idle_sec = 180.0
+            self.idle_sec = 600.0
         if self.idle_sec < 0:
             self.idle_sec = 0.0
         self._pool_ready = False
@@ -178,12 +181,16 @@ class TurnstileAPIServer:
             if self.lazy_browsers:
                 logger.info(
                     f"Lazy browser mode ON — pool starts on first captcha "
-                    f"(thread={self.thread_count}, idle_reclaim={self.idle_sec:.0f}s)"
+                    f"(thread={self.thread_count}, reuse_page={self.reuse_pages}, "
+                    f"idle_reclaim={self.idle_sec:.0f}s)"
                 )
                 if self.idle_sec > 0:
                     self._idle_task = asyncio.create_task(self._idle_reaper())
             else:
-                logger.info("Starting browser initialization (eager)")
+                logger.info(
+                    f"Starting browser prewarm (eager, thread={self.thread_count}, "
+                    f"reuse_page={self.reuse_pages})"
+                )
                 await self._initialize_browser()
                 self._pool_ready = True
                 self._last_used = time.time()
@@ -263,9 +270,19 @@ class TurnstileAPIServer:
                 browser = await camoufox.start()
 
             if browser:
-                item = (i + 1, browser, config)
-                owned.append(item)
-                await self.browser_pool.put(item)
+                owned.append((i + 1, browser, config))
+                session = None
+                if self.reuse_pages:
+                    try:
+                        session = await self._create_session(
+                            browser, config, self._pick_proxy() if self.proxy_support else None, i + 1
+                        )
+                        if self.debug:
+                            logger.info(f"Browser {i + 1}: page session prewarmed")
+                    except Exception as e:
+                        logger.warning(f"Browser {i + 1}: page prewarm failed: {e}")
+                        session = None
+                await self.browser_pool.put((i + 1, browser, config, session))
 
             if self.debug:
                 logger.info(f"Browser {i + 1} initialized successfully with {config['browser_name']} {config['browser_version']}")
@@ -273,7 +290,10 @@ class TurnstileAPIServer:
         self._owned_browsers = owned
         self._pool_ready = True
         self._last_used = time.time()
-        logger.info(f"Browser pool initialized with {self.browser_pool.qsize()} browsers")
+        logger.info(
+            f"Browser pool initialized with {self.browser_pool.qsize()} browsers "
+            f"(reuse_page={self.reuse_pages})"
+        )
 
         if self.use_random_config:
             logger.info(f"Each browser in pool received random configuration")
@@ -289,14 +309,143 @@ class TurnstileAPIServer:
                 logger.debug(f"Browser {i+1} Sec-CH-UA: {config['sec_ch_ua']}")
 
     async def _drain_pool_discard(self) -> None:
-        """Empty the asyncio queue without closing browsers (caller closes)."""
+        """Empty the asyncio queue; close reusable page sessions when present."""
         while True:
             try:
-                self.browser_pool.get_nowait()
+                item = self.browser_pool.get_nowait()
             except asyncio.QueueEmpty:
                 break
             except Exception:
                 break
+            try:
+                _index, _browser, _config, session = self._unpack_pool_item(item)
+                await self._close_session(session)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _unpack_pool_item(item):
+        """Normalize pool tuple to (index, browser, config, session)."""
+        if not item:
+            return None, None, None, None
+        if len(item) >= 4:
+            return item[0], item[1], item[2], item[3]
+        if len(item) == 3:
+            return item[0], item[1], item[2], None
+        return None, None, None, None
+
+    def _load_proxies(self) -> list:
+        if not self.proxy_support:
+            return []
+        proxy_file_path = os.path.join(os.getcwd(), "proxies.txt")
+        try:
+            with open(proxy_file_path) as proxy_file:
+                return [line.strip() for line in proxy_file if line.strip()]
+        except FileNotFoundError:
+            return []
+        except Exception as e:
+            logger.error(f"Error reading proxy file: {str(e)}")
+            return []
+
+    def _pick_proxy(self) -> Optional[str]:
+        proxies = self._load_proxies()
+        return random.choice(proxies) if proxies else None
+
+    async def _session_alive(self, session: Optional[dict]) -> bool:
+        if not session:
+            return False
+        page = session.get("page")
+        context = session.get("context")
+        if page is None or context is None:
+            return False
+        try:
+            if page.is_closed():
+                return False
+        except Exception:
+            return False
+        return True
+
+    async def _close_session(self, session: Optional[dict]) -> None:
+        if not session:
+            return
+        page = session.get("page")
+        context = session.get("context")
+        session["page"] = None
+        session["context"] = None
+        if page is not None:
+            try:
+                if not page.is_closed():
+                    await page.close()
+            except Exception:
+                pass
+        if context is not None:
+            try:
+                await context.close()
+            except Exception:
+                pass
+
+    async def _create_session(
+        self,
+        browser,
+        browser_config: Optional[dict],
+        proxy: Optional[str],
+        index: int,
+    ) -> dict:
+        context_options = self._build_context_options(
+            browser_config or {}, proxy if self.proxy_support else None
+        )
+        try:
+            context = await browser.new_context(**context_options)
+        except Exception as ctx_err:
+            if self.debug:
+                logger.warning(
+                    f"Browser {index}: new_context failed ({ctx_err}); retry minimal options"
+                )
+            context = await browser.new_context(no_viewport=True)
+
+        page = await context.new_page()
+        try:
+            await page.set_viewport_size({"width": 500, "height": 100})
+        except Exception:
+            pass
+
+        await self._antishadow_inject(page)
+        await page.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', {
+            get: () => undefined,
+        });
+
+        window.chrome = {
+            runtime: {},
+            loadTimes: function() {},
+            csi: function() {},
+        };
+        """)
+        return {"context": context, "page": page, "proxy": proxy}
+
+    async def _ensure_session(
+        self,
+        browser,
+        browser_config: Optional[dict],
+        session: Optional[dict],
+        index: int,
+    ) -> Optional[dict]:
+        sticky_proxy = (session or {}).get("proxy") if session else None
+        if self.reuse_pages and await self._session_alive(session):
+            needs_proxy = self.proxy_support and bool(self._load_proxies())
+            if needs_proxy and not sticky_proxy:
+                await self._close_session(session)
+            else:
+                return session
+        elif session:
+            await self._close_session(session)
+
+        proxy = sticky_proxy if sticky_proxy else (self._pick_proxy() if self.proxy_support else None)
+        try:
+            return await self._create_session(browser, browser_config, proxy, index)
+        except Exception as e:
+            logger.error(f"Browser {index}: failed to create page session: {e}")
+            return None
 
     async def _close_maybe_async(self, obj, *method_names: str, label: str = "resource") -> bool:
         """Best-effort close helper for browser/driver objects."""
@@ -881,14 +1030,13 @@ class TurnstileAPIServer:
 
     async def _solve_turnstile(self, task_id: str, url: str, sitekey: str, action: Optional[str] = None, cdata: Optional[str] = None):
         """Solve the Turnstile challenge."""
-        proxy = None
-        context = None
-        page = None
         start_time = time.time()
         index = None
         browser = None
         browser_config = None
+        session = None
         acquired = False
+        solved_ok = False
 
         # Mark in-flight before warm-up so the idle reaper cannot reclaim mid-acquire.
         # Always pair with the outer finally decrement — never leave this sticky.
@@ -897,7 +1045,8 @@ class TurnstileAPIServer:
             try:
                 await self._ensure_pool()
                 self._last_used = time.time()
-                index, browser, browser_config = await self.browser_pool.get()
+                raw = await self.browser_pool.get()
+                index, browser, browser_config, session = self._unpack_pool_item(raw)
                 acquired = True
                 self._last_used = time.time()
             except Exception as e:
@@ -909,7 +1058,8 @@ class TurnstileAPIServer:
                 if hasattr(browser, 'is_connected') and not browser.is_connected():
                     if self.debug:
                         logger.warning(f"Browser {index}: Browser disconnected, skipping")
-                    await self.browser_pool.put((index, browser, browser_config))
+                    await self._close_session(session)
+                    await self.browser_pool.put((index, browser, browser_config, None))
                     acquired = False
                     await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": 0, "error": "browser_disconnected"})
                     return
@@ -917,89 +1067,43 @@ class TurnstileAPIServer:
                 if self.debug:
                     logger.warning(f"Browser {index}: Cannot check browser state: {str(e)}")
 
-            if self.proxy_support:
-                proxy_file_path = os.path.join(os.getcwd(), "proxies.txt")
-
-                try:
-                    with open(proxy_file_path) as proxy_file:
-                        proxies = [line.strip() for line in proxy_file if line.strip()]
-
-                    proxy = random.choice(proxies) if proxies else None
-
-                    if self.debug and proxy:
-                        logger.debug(f"Browser {index}: Selected proxy: {proxy}")
-                    elif self.debug and not proxy:
-                        logger.debug(f"Browser {index}: No proxies available")
-
-                except FileNotFoundError:
-                    logger.warning(f"Proxy file not found: {proxy_file_path}")
-                    proxy = None
-                except Exception as e:
-                    logger.error(f"Error reading proxy file: {str(e)}")
-                    proxy = None
-
-                if proxy and self.debug:
-                    logger.debug(f"Browser {index}: Creating context with proxy enabled")
-                elif self.debug:
-                    logger.debug(f"Browser {index}: Creating context without proxy")
-
-                context_options = self._build_context_options(browser_config or {}, proxy if self.proxy_support else None)
-                try:
-                    context = await browser.new_context(**context_options)
-                except Exception as ctx_err:
-                    # Fallback for Camoufox protocol mismatches / stricter option sets.
-                    if self.debug:
-                        logger.warning(f"Browser {index}: new_context failed ({ctx_err}); retry minimal options")
-                    context = await browser.new_context(no_viewport=True)
-            else:
-                if self.debug:
-                    logger.debug(f"Browser {index}: Creating context without proxy")
-                context_options = self._build_context_options(browser_config or {}, None)
-                try:
-                    context = await browser.new_context(**context_options)
-                except Exception as ctx_err:
-                    if self.debug:
-                        logger.warning(f"Browser {index}: new_context failed ({ctx_err}); retry minimal options")
-                    context = await browser.new_context(no_viewport=True)
-
-            page = await context.new_page()
-
             try:
-                await page.set_viewport_size({"width": 500, "height": 100})
-            except Exception:
-                pass
+                session = await self._ensure_session(browser, browser_config, session, index)
+                if not session or not session.get("page"):
+                    await save_result(task_id, "turnstile", {
+                        "value": "CAPTCHA_FAIL",
+                        "elapsed_time": round(time.time() - start_time, 3),
+                        "error": "session_create_failed",
+                    })
+                    return
 
-            await self._antishadow_inject(page)
-            await self._block_rendering(page)
-            await page.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', {
-            get: () => undefined,
-        });
+                page = session["page"]
+                proxy = session.get("proxy")
 
-        window.chrome = {
-            runtime: {},
-            loadTimes: function() {},
-            csi: function() {},
-        };
-        """)
-
-            try:
                 if self.debug:
-                    logger.debug(f"Browser {index}: Starting Turnstile solve for URL: {url} with Sitekey: {sitekey} | Action: {action} | Cdata: {cdata} | Proxy: {proxy}")
-                    logger.debug(f"Browser {index}: Setting up optimized page loading with resource blocking")
-                    logger.debug(f"Browser {index}: Loading real website directly: {url}")
+                    logger.debug(
+                        f"Browser {index}: Starting Turnstile solve for URL: {url} "
+                        f"with Sitekey: {sitekey} | Action: {action} | Cdata: {cdata} | "
+                        f"Proxy: {proxy} | reuse={self.reuse_pages}"
+                    )
 
-                await page.goto(url, wait_until='domcontentloaded', timeout=30000)
-                await self._unblock_rendering(page)
+                await self._block_rendering(page)
+                try:
+                    await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+                finally:
+                    try:
+                        await self._unblock_rendering(page)
+                    except Exception:
+                        pass
 
                 if self.debug:
                     logger.debug(f"Browser {index}: Injecting Turnstile widget directly into target site")
 
                 await self._inject_captcha_directly(page, sitekey, action or '', cdata or '', index)
-                await asyncio.sleep(3)
 
+                # Poll immediately — no fixed 3s dead wait. CF often resolves in <2s.
                 locator = page.locator('input[name="cf-turnstile-response"]')
-                max_attempts = 30
+                max_attempts = 40
                 click_count = 0
                 max_clicks = 10
 
@@ -1017,11 +1121,12 @@ class TurnstileAPIServer:
                                 logger.debug(f"Browser {index}: No token elements found on attempt {attempt + 1}")
                         elif count == 1:
                             try:
-                                token = await locator.input_value(timeout=500)
+                                token = await locator.input_value(timeout=300)
                                 if token:
                                     elapsed_time = round(time.time() - start_time, 3)
                                     logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
                                     await save_result(task_id, "turnstile", {"value": token, "elapsed_time": elapsed_time})
+                                    solved_ok = True
                                     return
                             except Exception as e:
                                 if self.debug:
@@ -1031,18 +1136,19 @@ class TurnstileAPIServer:
                                 logger.debug(f"Browser {index}: Found {count} token elements, checking all")
                             for i in range(count):
                                 try:
-                                    element_token = await locator.nth(i).input_value(timeout=500)
+                                    element_token = await locator.nth(i).input_value(timeout=300)
                                     if element_token:
                                         elapsed_time = round(time.time() - start_time, 3)
                                         logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{element_token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
                                         await save_result(task_id, "turnstile", {"value": element_token, "elapsed_time": elapsed_time})
+                                        solved_ok = True
                                         return
                                 except Exception as e:
                                     if self.debug:
                                         logger.debug(f"Browser {index}: Token element {i} check failed: {str(e)}")
                                     continue
 
-                        if attempt > 2 and attempt % 3 == 0 and click_count < max_clicks:
+                        if attempt > 1 and attempt % 3 == 0 and click_count < max_clicks:
                             click_success = await self._try_click_strategies(page, index)
                             click_count += 1
                             if click_success and self.debug:
@@ -1050,7 +1156,7 @@ class TurnstileAPIServer:
                             elif not click_success and self.debug:
                                 logger.debug(f"Browser {index}: All click strategies failed on attempt {attempt + 1} (click #{click_count}/{max_clicks})")
 
-                        wait_time = min(0.5 + (attempt * 0.05), 2.0)
+                        wait_time = min(0.2 + (attempt * 0.03), 1.0)
                         await asyncio.sleep(wait_time)
 
                         if self.debug and attempt % 5 == 0:
@@ -1070,17 +1176,17 @@ class TurnstileAPIServer:
                 await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time, "error": str(e)})
                 logger.error(f"Browser {index}: Error solving Turnstile: {str(e)}")
             finally:
-                if self.debug:
-                    logger.debug(f"Browser {index}: Closing browser context and cleaning up")
-
-                if context is not None:
-                    try:
-                        await context.close()
-                        if self.debug:
-                            logger.debug(f"Browser {index}: Context closed successfully")
-                    except Exception as e:
-                        if self.debug:
-                            logger.warning(f"Browser {index}: Error closing context: {str(e)}")
+                # Keep healthy pages when reuse is on; drop failed/dirty sessions.
+                if not self.reuse_pages or not solved_ok:
+                    if self.debug:
+                        logger.debug(
+                            f"Browser {index}: Dropping page session "
+                            f"(reuse={self.reuse_pages}, solved={solved_ok})"
+                        )
+                    await self._close_session(session)
+                    session = None
+                elif self.debug:
+                    logger.debug(f"Browser {index}: Reusing page session for next solve")
 
                 try:
                     if acquired and browser is not None and index is not None:
@@ -1091,11 +1197,13 @@ class TurnstileAPIServer:
                         except Exception:
                             connected = True
                         if connected:
-                            await self.browser_pool.put((index, browser, browser_config))
+                            await self.browser_pool.put((index, browser, browser_config, session))
                             if self.debug:
                                 logger.debug(f"Browser {index}: Browser returned to pool")
-                        elif self.debug:
-                            logger.warning(f"Browser {index}: Browser disconnected, not returning to pool")
+                        else:
+                            await self._close_session(session)
+                            if self.debug:
+                                logger.warning(f"Browser {index}: Browser disconnected, not returning to pool")
                 except Exception as e:
                     if self.debug:
                         logger.warning(f"Browser {index}: Error returning browser to pool: {str(e)}")
@@ -1317,6 +1425,7 @@ class TurnstileAPIServer:
         return jsonify({
             "ok": True,
             "lazy": bool(self.lazy_browsers),
+            "reuse_page": bool(self.reuse_pages),
             "idle_sec": self.idle_sec,
             "pool_ready": bool(self._pool_ready),
             "thread": self.thread_count,
